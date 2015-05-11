@@ -1,0 +1,338 @@
+package main;
+
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.nio.IntBuffer;
+import java.sql.ResultSet;
+
+import org.apache.log4j.Logger;
+import org.apache.thrift.TException;
+
+import tachyon.CommonUtils;
+import tachyon.Constants;
+import tachyon.Version;
+import tachyon.client.OutStream;
+import tachyon.client.TachyonByteBuffer;
+import tachyon.client.TachyonFS;
+import tachyon.client.TachyonFile;
+import tachyon.client.WriteType;
+import tachyon.conf.UserConf;
+import tachyon.thrift.FileAlreadyExistException;
+import tachyon.thrift.InvalidPathException;
+import tachyon.thrift.SuspectedFileSizeException;
+
+public class main {
+	private static Logger LOG = Logger.getLogger(Constants.LOGGER_TYPE);
+	private static final int RESULT_ARRAY_SIZE = 64;
+	private static final String FOLDER = "/mnt/ramdisk/";
+
+	private static TachyonFS MTC = null;
+	private static String MASTER_ADDRESS = null;
+	private static String FILE_NAME = null;
+	private static int BLOCK_SIZE_BYTES = -1;
+	private static int BLOCKS_PER_FILE = -1;
+	private static int THREADS = -1;
+	private static int FILES = -1;
+	private static boolean DEBUG_MODE = false;
+	private static int FILE_BYTES = -1;
+	private static long FILES_BYTES = -1;
+	private static String RESULT_PREFIX = null;
+	private static int BASE_FILE_NUMBER = 0;
+	private static byte[] result = new byte[RESULT_ARRAY_SIZE];
+
+	public static void createFiles() throws IOException {
+		long startTimeMs = CommonUtils.getCurrentMs();
+		String basename=new File(FILE_NAME).getName();
+		for (int k = 0; k < FILES; k++) {//THREADS
+			int fileId = MTC.createFile("/"+basename + (k + BASE_FILE_NUMBER));
+			CommonUtils.printTimeTakenMs(startTimeMs, LOG,
+					"user_createFiles with fileId " + fileId);
+		}
+	}
+
+	public static void logPerIteration(long startTimeMs, int times, String msg,
+			int workerId) {
+		// 每次迭代最后的写日志操作由该函数完成，参数里获得这次迭代的开始时间，由此计算一个线程的处理时间
+		// 记录这个线程的统计数据
+		long takenTimeMs = System.currentTimeMillis() - startTimeMs;
+		double result = 1000L * FILE_BYTES / takenTimeMs / 1024 / 1024;
+		LOG.info(times + msg + workerId + " : " + result + " Mb/sec. Took "
+				+ takenTimeMs + " ms. ");
+	}
+
+	public static abstract class Worker extends Thread {
+		protected int mWorkerId;
+		protected int mLeft;
+		protected int mRight;
+		protected ByteBuffer mBuf;
+
+		public Worker(int id, int left, int right, ByteBuffer buf) {
+			mWorkerId = id;
+			mLeft = left;
+			mRight = right;
+			mBuf = buf;
+		}
+	}
+
+	public static class TachyonWriterWorker extends Worker {
+		private TachyonFS mTC;
+
+		public TachyonWriterWorker(int id, int left, int right, ByteBuffer buf) {
+			super(id, left, right, buf);
+			mTC = TachyonFS.get(MASTER_ADDRESS);
+		}
+
+		public void writeParition() throws IOException,
+			   SuspectedFileSizeException, InvalidPathException, TException {
+				   if (DEBUG_MODE) {
+					   mBuf.flip();
+					   CommonUtils.printByteBuffer(LOG, mBuf);
+				   }
+
+				   mBuf.flip();
+				   try {
+					   for (int pId = mLeft; pId < mRight; pId++) {
+						   //FileInputStream in = new FileInputStream("/mnt/sda4/home/xiaoben/tachyon/tmp"  + FILE_NAME + (pId + BASE_FILE_NUMBER));
+						   FileInputStream in = new FileInputStream(FILE_NAME + (pId + BASE_FILE_NUMBER));
+						   long startTimeMs = System.currentTimeMillis();// 获取开始时间
+
+						   String basename=new File(FILE_NAME).getName();
+						   TachyonFile file = mTC.getFile("/"+basename
+								   + (pId + BASE_FILE_NUMBER));// 获得Tachyon上的文件句柄
+						   OutStream os = file.getOutStream(WriteType.TRY_CACHE);
+						   /*
+							* for (int k = 0; k < BLOCKS_PER_FILE; k++) {
+							* mBuf.array()[0] = (byte) (k + mWorkerId);
+							* os.write(mBuf.array());// 写数据 }
+							*/
+						   byte[] tempbytes = new byte[BLOCK_SIZE_BYTES];
+						   int byteread = 0;
+						   while ((byteread = in.read(tempbytes)) != -1) {
+							   ByteBuffer buf = ByteBuffer.wrap(tempbytes);
+
+							   buf.order(ByteOrder.nativeOrder());
+							   os.write(buf.array());// 写数据
+						   }
+						   os.close();
+						   logPerIteration(startTimeMs, pId,
+								   "th WriteTachyonFile @ Worker ", pId);// 写日志
+					   }
+				   } catch (Exception e) {
+					   e.printStackTrace();
+				   }
+		}
+
+		@Override
+			public void run() {
+				try {
+					writeParition();
+				} catch (Exception e) {
+					CommonUtils.runtimeException(e);
+				}
+				LOG.info("WriteWorker " + mWorkerId + " just finished.");
+			}
+	}
+
+	public static class TachyonReadWorker extends Worker {
+		private TachyonFS mTC;
+
+		public TachyonReadWorker(int id, int left, int right, ByteBuffer buf) {
+			super(id, left, right, buf);
+			mTC = TachyonFS.get(MASTER_ADDRESS);
+		}
+
+		public void readPartition() throws IOException,
+			   SuspectedFileSizeException, InvalidPathException, TException {
+				   TachyonByteBuffer buf;
+				   if (DEBUG_MODE && false) {
+					   // 调试模式
+					   LOG.info("Verifying the reading data...");
+
+					   for (int pId = mLeft; pId < mRight; pId++) {
+						   String basename=new File(FILE_NAME).getName();
+						   TachyonFile file = mTC.getFile("/"+basename+ pId);
+						   buf = file.readByteBuffer();
+						   IntBuffer intBuf;
+						   intBuf = buf.DATA.asIntBuffer();
+						   int tmp;
+						   for (int i = 0; i < BLOCKS_PER_FILE; i++) {
+							   for (int k = 0; k < BLOCK_SIZE_BYTES / 4; k++) {
+								   tmp = intBuf.get();
+								   if ((k == 0 && tmp == (i + mWorkerId))
+										   || (k != 0 && tmp == k)) {
+								   } else {
+									   CommonUtils.runtimeException("WHAT? " + tmp
+											   + " " + k);
+								   }
+							   }
+						   }
+						   buf.close();
+					   }
+				   }
+
+				   for (int pId = mLeft; pId < mRight; pId++) {
+					   long startTimeMs = System.currentTimeMillis();// 获取开始时间
+					   String basename=new File(FILE_NAME).getName();
+					   TachyonFile file = mTC.getFile("/"+basename
+							   + (pId + BASE_FILE_NUMBER));// 获得Tachyon上的文件句柄
+					   buf = file.readByteBuffer();
+					   for (int i = 0; i < BLOCKS_PER_FILE; i++) {
+						   buf.DATA.get(mBuf.array());// 读数据
+						   //调试
+						   if(i==0)
+						   {
+							   System.out.write(mBuf.array());
+							   System.out.println();
+							   System.out.println( pId+"!!!!!!!!!!!!!!!!!!!!!");
+						   }
+					   }
+
+					   if (DEBUG_MODE) {
+						   buf.DATA.flip();
+						   CommonUtils.printByteBuffer(LOG, buf.DATA);
+					   }
+					   buf.DATA.clear();
+					   logPerIteration(startTimeMs, pId,
+							   "th ReadTachyonFile @ Worker ", pId);
+					   buf.close();
+				   }
+		}
+
+		@Override
+			public void run() {
+				try {
+					readPartition();
+				} catch (Exception e) {
+					CommonUtils.runtimeException(e);
+				}
+				LOG.info("ReadWorker " + mWorkerId + " just finished.");
+			}
+	}
+
+	private static void TachyonTest(boolean write) {
+		ByteBuffer[] bufs = new ByteBuffer[THREADS];// 创建ByteBuffer
+
+		for (int thread = 0; thread < THREADS; thread++) {// 初始化ByteBuffer
+			ByteBuffer sRawData = ByteBuffer.allocate(BLOCK_SIZE_BYTES);
+			sRawData.order(ByteOrder.nativeOrder());
+
+			for (int k = 0; k < BLOCK_SIZE_BYTES / 4; k++) {
+				sRawData.putInt(k);
+			}
+			bufs[thread] = sRawData;
+		}
+
+		Worker[] WWs = new Worker[THREADS];
+		int t = FILES / THREADS;
+		for (int thread = 0; thread < THREADS; thread++) {
+			if (write) {
+				WWs[thread] = new TachyonWriterWorker(thread, t * thread, t
+						* (thread + 1), bufs[thread]);
+			} else {
+				WWs[thread] = new TachyonReadWorker(thread, t * thread, t
+						* (thread + 1), bufs[thread]);
+			}
+		}
+
+		long startTimeMs = System.currentTimeMillis();
+		for (int thread = 0; thread < THREADS; thread++) {
+			WWs[thread].start();
+		}
+		for (int thread = 0; thread < THREADS; thread++) {
+			try {
+				WWs[thread].join();
+			} catch (InterruptedException e) {
+				CommonUtils.runtimeException(e);
+			}
+		}
+		long takenTimeMs = System.currentTimeMillis() - startTimeMs;
+		System.out.print(takenTimeMs);
+		double result = FILES_BYTES * 1000L / takenTimeMs / 1024 / 1024;
+		LOG.info(result + " Mb/sec. " + RESULT_PREFIX + "Entire "
+				+ (write ? "Write " : "Read ") + " Took " + takenTimeMs
+				+ " ms. Current System Time: " + System.currentTimeMillis());
+	}
+
+	/**
+	 * @param args
+	 */
+	public static void main(String[] args) throws IOException,
+		   InvalidPathException, FileAlreadyExistException {
+			   // TODO Auto-generated method stub
+			   if (args.length != 8) {
+				   System.out
+					   .println("java -cp target/tachyon-"
+							   + Version.VERSION
+							   + "-jar-with-dependencies.jar tachyon.examples.Performance "
+							   + "<MasterIp> <FileName> <BlockSizeInBytes> <FileSize> "
+							   + "<Threads> <FilesPerThread> <TestCaseNumber> <BaseFileNumber>\n"
+							   + "1: Files Write Test\n" + "2: Files Read Test\n"
+							   + "3: RamFile Write Test \n"
+							   + "4: RamFile Read Test \n"
+							   + "5: ByteBuffer Write Test \n"
+							   + "6: ByteBuffer Read Test \n");
+				   System.exit(-1);
+			   }
+			   // 参数一：主节点 主机名以及端口号 xiaoben:19998
+			   // 参数二：文件名
+			   // 参数三：数据块大小 （按B算）
+			   // 参数四：输出的单个文件大小 （按B算）
+			   // 参数五：线程数
+			   // 参数六：每个线程多少个文件
+			   // 参数七：测试情况（1.Tachyon写 2.Tachyon读）
+			   // 参数八：基础文件数，默认为0
+
+			   MASTER_ADDRESS = args[0];
+			   FILE_NAME = args[1];
+			   BLOCK_SIZE_BYTES = Integer.parseInt(args[2]);
+			   FILE_BYTES = Integer.parseInt(args[3]);
+			   DEBUG_MODE = false;
+			   THREADS = Integer.parseInt(args[4]);
+			   FILES = Integer.parseInt(args[5]) * THREADS;
+			   int testCase = Integer.parseInt(args[6]);
+			   BASE_FILE_NUMBER = Integer.parseInt(args[7]);
+
+			   BLOCKS_PER_FILE = FILE_BYTES / BLOCK_SIZE_BYTES;
+
+			   FILES_BYTES = 1L * FILE_BYTES * FILES;
+
+			   RESULT_PREFIX = String
+				   .format("Threads %d FilesPerThread %d TotalFiles %d "
+						   + "BLOCK_SIZE_KB %d BLOCKS_PER_FILE %d FILE_SIZE_MB %d "
+						   + "Tachyon_WRITE_BUFFER_SIZE_KB %d BaseFileNumber %d : ",
+						   THREADS, FILES / THREADS, FILES,
+						   BLOCK_SIZE_BYTES / 1024, BLOCKS_PER_FILE,
+						   CommonUtils.getMB(FILE_BYTES),
+						   UserConf.get().FILE_BUFFER_BYTES / 1024,
+						   BASE_FILE_NUMBER);
+
+			   result = new byte[BLOCK_SIZE_BYTES];
+
+			   if (testCase == 1) {
+				   RESULT_PREFIX = "TachyonFilesWriteTest " + RESULT_PREFIX;
+				   LOG.info(RESULT_PREFIX);
+				   MTC = TachyonFS.get(MASTER_ADDRESS);
+				   createFiles();
+				   TachyonTest(true);
+			   } else if (testCase == 2) {
+				   RESULT_PREFIX = "TachyonFilesReadTest " + RESULT_PREFIX;
+				   LOG.info(RESULT_PREFIX);
+				   MTC = TachyonFS.get(MASTER_ADDRESS);
+				   TachyonTest(false);
+			   } else {
+				   CommonUtils.runtimeException("No Test Case " + testCase);
+			   }
+
+			   /*
+				* for (int k = 0; k < RESULT_ARRAY_SIZE; k++) {
+				* System.out.print(Results[k] + " "); }
+				*/
+			   // System.out.write(Results);
+			   System.out.println();
+			   System.exit(0);
+	}
+
+}
